@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASG Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  body{background:#0e1320;color:#e7ecf5;font-family:'Sora',system-ui,sans-serif}
+  .mono{font-family:'JetBrains Mono',ui-monospace,monospace}
+  .panel{background:#161d30;border:1px solid #263049;border-radius:14px}
+  .muted{color:#8b97b3}
+  .dot{animation:pulse 1.6s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.35}}
+  @media (prefers-reduced-motion:reduce){.dot{animation:none}}
+  button:focus-visible{outline:2px solid #7dd3fc;outline-offset:2px}
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-5xl mx-auto px-4 py-8 space-y-5">
+
+  <header class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h1 class="text-2xl font-semibold">Auto Scaling Dashboard</h1>
+      <p class="muted text-sm">Each refresh may land on a different instance behind the load balancer.</p>
+    </div>
+    <div id="status" class="flex items-center gap-2 text-sm px-3 py-1.5 rounded-full panel"></div>
+  </header>
+
+  <div id="demo" class="hidden panel px-4 py-3 text-sm" style="border-color:#fbbf24;color:#fbbf24">
+    Showing demo data. metrics.json was not found, so this page is not running on an instance set up with page.sh.
+  </div>
+
+  <!-- Hero: the instance that answered last -->
+  <section id="hero" class="panel p-6 sm:p-8" style="border-radius:24px"></section>
+
+  <!-- Gauges -->
+  <section id="gauges" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4"></section>
+
+  <div class="grid lg:grid-cols-5 gap-5">
+    <!-- Details -->
+    <section class="panel p-5 lg:col-span-3">
+      <h2 class="font-semibold mb-3">Instance details</h2>
+      <dl id="details" class="grid sm:grid-cols-2 gap-x-6 gap-y-3 text-sm"></dl>
+    </section>
+
+    <!-- Fleet -->
+    <section class="panel p-5 lg:col-span-2">
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="font-semibold">Instances answering</h2>
+        <button id="reset" class="text-xs muted hover:text-white">Reset</button>
+      </div>
+      <p id="fleetSub" class="muted text-sm mb-4"></p>
+      <div id="fleet" class="space-y-3"></div>
+    </section>
+  </div>
+
+  <footer id="foot" class="muted text-xs text-center pt-2"></footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const hue = s => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7) % 360;
+const col = s => `hsl(${hue(s)} 80% 66%)`;
+const fmtUp = s => s >= 3600 ? `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m` : s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+
+let seen = {}, fails = 0, demo = false;
+try { seen = JSON.parse(sessionStorage.getItem('asg') || '{}'); } catch (e) {}
+
+// Fake data so you can preview the page on your laptop
+const ids = ['i-0a1b2c3d4e5f60718', 'i-0f9e8d7c6b5a40312', 'i-07c6d5e4f3a2b1908'];
+function fake() {
+  const n = Math.floor(Math.random() * 3);
+  return { id: ids[n], type: 't2.micro', az: ['us-east-1a', 'us-east-1b', 'us-east-1c'][n],
+    privateIp: `10.0.${n}.${20 + n * 7}`, publicIp: `54.21.${80 + n}.${100 + n * 13}`,
+    hostname: `ip-10-0-${n}-${20 + n * 7}.ec2.internal`, ami: 'ami-0abc123def456', asg: 'my-asg',
+    state: 'InService', vcpu: 1, cpu: +(10 + Math.random() * 75).toFixed(1), memUsedMb: 310 + n * 45,
+    memTotalMb: 949, disk: 22 + n, load1: +(Math.random() * 1.3).toFixed(2), load5: 0.41, load15: 0.28,
+    uptime: 3600 * (n + 1) + Math.floor(Math.random() * 99) };
+}
+
+function ring(p, label, sub) {
+  const c = 213.6, k = p > 85 ? '#f87171' : p > 60 ? '#fbbf24' : '#34d399';
+  return `<div class="panel p-4 flex items-center gap-4">
+    <svg width="84" height="84" viewBox="0 0 84 84" role="img" aria-label="${label} ${Math.round(p)} percent">
+      <circle cx="42" cy="42" r="34" fill="none" stroke="#263049" stroke-width="8"/>
+      <circle cx="42" cy="42" r="34" fill="none" stroke="${k}" stroke-width="8" stroke-linecap="round"
+        stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - Math.min(p, 100) / 100)}" transform="rotate(-90 42 42)"/>
+      <text x="42" y="47" text-anchor="middle" fill="#e7ecf5" font-size="15" font-weight="600">${Math.round(p)}%</text>
+    </svg>
+    <div><div class="font-medium">${label}</div><div class="muted text-xs mono mt-0.5">${sub}</div></div></div>`;
+}
+
+function render(d) {
+  const c = col(d.id), memP = d.memUsedMb / d.memTotalMb * 100, loadP = d.load1 / d.vcpu * 100;
+
+  $('hero').style.borderLeft = `6px solid ${c}`;
+  $('hero').innerHTML = `
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="muted text-sm mb-1">Latest response came from</p>
+        <p class="mono text-2xl sm:text-4xl font-medium break-all" style="color:${c}">${d.id}</p>
+      </div>
+      <span class="text-sm px-3 py-1 rounded-full" style="background:${c}22;color:${c}">${d.state}</span>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-5 mt-6">
+      ${[['Private IP', d.privateIp], ['Public IP', d.publicIp], ['Zone', d.az], ['Type', d.type]].map(([k, v]) =>
+        `<div><p class="muted text-xs">${k}</p><p class="mono text-lg">${v}</p></div>`).join('')}
+    </div>`;
+
+  $('gauges').innerHTML =
+    ring(d.cpu, 'CPU', `${d.vcpu} vCPU`) +
+    ring(memP, 'Memory', `${d.memUsedMb} / ${d.memTotalMb} MB`) +
+    ring(d.disk, 'Disk', 'root volume') +
+    ring(loadP, 'Load', `${d.load1} · ${d.load5} · ${d.load15}`);
+
+  const rows = [['Instance ID', d.id], ['Hostname', d.hostname], ['AMI', d.ami], ['Auto Scaling group', d.asg],
+    ['Lifecycle state', d.state], ['Uptime', fmtUp(d.uptime)], ['Private IP', d.privateIp], ['Public IP', d.publicIp]];
+  $('details').innerHTML = rows.map(([k, v]) =>
+    `<div><dt class="muted text-xs">${k}</dt>
+     <dd><button class="mono text-left break-all hover:text-sky-300" data-copy="${v}" title="Click to copy">${v}</button></dd></div>`).join('');
+}
+
+function track(d) {
+  const s = seen[d.id] || { n: 0 };
+  seen[d.id] = { n: s.n + 1, last: Date.now(), ip: d.privateIp, az: d.az, cpu: d.cpu };
+  try { sessionStorage.setItem('asg', JSON.stringify(seen)); } catch (e) {}
+  drawFleet();
+}
+
+function drawFleet() {
+  const list = Object.entries(seen).sort((a, b) => b[1].n - a[1].n);
+  const total = list.reduce((t, [, v]) => t + v.n, 0) || 1;
+  const live = list.filter(([, v]) => Date.now() - v.last < 15000).length;
+  $('fleetSub').textContent = list.length
+    ? `${live} active now, ${list.length} seen in this session. Share of ${total} responses:` : 'Waiting for the first response.';
+  $('fleet').innerHTML = list.map(([id, v]) => {
+    const on = Date.now() - v.last < 15000, k = col(id), pct = Math.round(v.n / total * 100);
+    return `<div style="opacity:${on ? 1 : .4}">
+      <div class="flex justify-between text-sm"><span class="mono" style="color:${k}">${id.slice(0, 10)}…${id.slice(-4)}</span>
+        <span class="muted">${on ? v.ip : 'gone'} · ${pct}%</span></div>
+      <div class="h-2 rounded-full mt-1.5" style="background:#263049"><div class="h-2 rounded-full" style="width:${pct}%;background:${k};transition:width .5s"></div></div>
+    </div>`;
+  }).join('');
+}
+
+async function tick() {
+  let d;
+  try {
+    const r = await fetch('metrics.json?t=' + Date.now(), { cache: 'no-store' });
+    if (!r.ok) throw 0;
+    d = await r.json(); fails = 0; demo = false;
+  } catch (e) {
+    if (++fails >= 3) { d = fake(); demo = true; }
+  }
+  $('demo').classList.toggle('hidden', !demo);
+  $('status').innerHTML = demo
+    ? '<span class="w-2 h-2 rounded-full" style="background:#fbbf24"></span>Demo'
+    : '<span class="dot w-2 h-2 rounded-full" style="background:#34d399"></span>Live';
+  if (d) { render(d); track(d); $('foot').textContent = 'Refreshes every 3 seconds · last update ' + new Date().toLocaleTimeString(); }
+}
+
+$('reset').onclick = () => { seen = {}; try { sessionStorage.removeItem('asg'); } catch (e) {} drawFleet(); };
+document.addEventListener('click', e => {
+  const b = e.target.closest('[data-copy]');
+  if (b) navigator.clipboard?.writeText(b.dataset.copy);
+});
+drawFleet(); tick(); setInterval(tick, 3000); setInterval(drawFleet, 5000);
+</script>
+</body>
+</html>
